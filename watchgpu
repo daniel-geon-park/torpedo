@@ -4,10 +4,10 @@ set -u
 
 usage() {
   cat <<'EOF'
-Usage: gpustat [-w [interval]] [-p] [-u] [[user@]host[:port][!tt|!mac] ...]
+Usage: gpustat [-w [interval]] [-p] [-u] [[user@]host[:port][~tt|~mac] ...]
 
 Show GPU status (utilization, temperature, power, memory, processes)
-across servers over ssh. Append !tt for Tenstorrent or !mac for Apple Silicon.
+across servers over ssh. Append ~tt for Tenstorrent or ~mac for Apple Silicon.
 
 Options:
   -w [interval]  watch mode: refresh every <interval> seconds (default 0.1)
@@ -21,7 +21,7 @@ user and launch time (-u/-t) are only shown on the family's parent.
 
 At least one host must be supplied. Host defaults belong in the caller.
 ssh-config aliases, user@host, and user@host:port all work, e.g.:
-  gpustat dgx1 ubuntu@10.0.0.5:32123 p150a!tt mac1!mac
+  gpustat dgx1 ubuntu@10.0.0.5:32123 p150a~tt mac1~mac
 EOF
 }
 
@@ -53,7 +53,7 @@ HOSTS=("$@")
 # HOST column width: fit the longest address given
 HOSTW=4
 for h in "${HOSTS[@]}"; do
-  label=${h%'!tt'}; label=${label%'!mac'}
+  label=${h%'~tt'}; label=${label%'~mac'}
   [ ${#label} -gt "$HOSTW" ] && HOSTW=${#label}
 done
 
@@ -183,6 +183,10 @@ fi
 
 # tint <value> <yellow-threshold> <red-threshold> -> sets $TINT
 tint() {
+  if [[ ! $1 =~ ^[0-9]+$ ]]; then
+    TINT=$DIM
+    return
+  fi
   if   [ "$1" -ge "$3" ]; then TINT=$RED
   elif [ "$1" -ge "$2" ]; then TINT=$YEL
   else TINT=$GRN; fi
@@ -222,10 +226,10 @@ clip_procs() {
 # split [user@]host[:port] into ssh target + optional -p flag
 ssh_target() {
   TARGET=$1 PORT= KIND=cuda
-  if [[ $TARGET == *'!tt' ]]; then
-    KIND=tt TARGET=${TARGET%'!tt'}
-  elif [[ $TARGET == *'!mac' ]]; then
-    KIND=mac TARGET=${TARGET%'!mac'}
+  if [[ $TARGET == *'~tt' ]]; then
+    KIND=tt TARGET=${TARGET%'~tt'}
+  elif [[ $TARGET == *'~mac' ]]; then
+    KIND=mac TARGET=${TARGET%'~mac'}
   fi
   if [[ $TARGET == *:* && ${TARGET##*:} =~ ^[0-9]+$ ]]; then
     PORT=${TARGET##*:} TARGET=${TARGET%:*}
@@ -264,7 +268,7 @@ render() {
   printf "${BOLD}%-${HOSTW}s %-14s %5s %5s %7s %15s  %s${RST}\n" \
     HOST GPU UTIL TEMP POWER "MEM(used/total)" PROCS
   for h in "${HOSTS[@]}"; do
-    label=${h%'!tt'}; label=${label%'!mac'}
+    label=${h%'~tt'}; label=${label%'~mac'}
     if [ ! -f "$tmpdir/$h.ok" ]; then
       if [ -f "$tmpdir/$h.err" ]; then
         printf "${CYAN}%-${HOSTW}s${RST} ${RED}UNREACHABLE: %s${RST}\n" \
@@ -286,8 +290,15 @@ render() {
     fi
     ssh_target "$h"
     if [ "$KIND" = tt ]; then
+      first_device=1
       while IFS=$'\t' read -r idx name temp power held mem_used mem_total procs; do
         [ -z "$idx" ] && continue
+        if [ "$first_device" = 1 ]; then
+          row_label=$label
+          first_device=0
+        else
+          row_label=' --'
+        fi
         procs=$(clip_procs "$pbudget" "$procs")
         if [ "$held" = true ]; then busy=HELD; c_busy=$YEL; else busy=idle; c_busy=$GRN; fi
         case $temp in
@@ -302,7 +313,7 @@ render() {
           c_mem=$DIM; mem_display=$(printf '%15s' 'N/A')
         fi
         printf "${CYAN}%-${HOSTW}s${RST} %-14s ${c_busy}%5s${RST} ${c_temp}%4sC${RST} %6sW ${c_mem}%s${RST}  %s%s\n" \
-          "$label" "TT${idx}/${name:0:10}" "$busy" "$temp_whole" "${power:-?}" "$mem_display" \
+          "$row_label" "TT${idx}/${name:0:10}" "$busy" "$temp_whole" "${power:-?}" "$mem_display" \
           "$staletag" "${procs:-${DIM}-${RST}}"
       done < <(jq -r --argjson sp "$SHOWPID" --argjson su "$SHOWUSER" '
         .devices[] | [
@@ -412,14 +423,25 @@ render() {
         }')
     read -r mused mtotal <<< "$mem"
     mempct=$(( mused * 100 / mtotal ))
+    first_gpu=1
     while IFS=',' read -r idx name util temp pdraw; do
+      # nvidia-smi can print a device error before otherwise valid CSV rows
+      # (for example when one GPU has fallen off the bus). Do not render that
+      # diagnostic as an empty GPU record.
+      [[ $idx =~ ^[0-9]+$ ]] || continue
+      if [ "$first_gpu" = 1 ]; then
+        row_label=$label
+        first_gpu=0
+      else
+        row_label=' --'
+      fi
       name=${name# } util=${util# } temp=${temp# } pdraw=${pdraw# }
       # keep escapes in the format string, not the args — they'd break %-Ns widths
       tint "$util" 30 70;   c_util=$TINT
       tint "$temp" 60 80;   c_temp=$TINT
       tint "$mempct" 60 85; c_mem=$TINT
       printf "${CYAN}%-${HOSTW}s${RST} %-14s ${c_util}%4s%%${RST} ${c_temp}%4sC${RST} %6sW ${c_mem}%6sM/%7sM${RST}  %s%s\n" \
-        "$label" "${name:0:14}" "$util" "$temp" "$pdraw" "$mused" "$mtotal" \
+        "$row_label" "${name:0:14}" "$util" "$temp" "$pdraw" "$mused" "$mtotal" \
         "$staletag" "${procs:-${DIM}-${RST}}"
     done <<< "$gpu"
   done
