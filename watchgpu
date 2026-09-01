@@ -436,6 +436,8 @@ render() {
         row_label=' --'
       fi
       name=${name# } util=${util# } temp=${temp# } pdraw=${pdraw# }
+      name=${name#NVIDIA }
+      name=${name#GeForce }
       # keep escapes in the format string, not the args — they'd break %-Ns widths
       tint "$util" 30 70;   c_util=$TINT
       tint "$temp" 60 80;   c_temp=$TINT
