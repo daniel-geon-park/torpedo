@@ -176,10 +176,35 @@ trap 'rm -rf "$tmpdir"' EXIT
 # colors only on a tty, and not when NO_COLOR is set
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   BOLD=$'\033[1m' DIM=$'\033[2m' CYAN=$'\033[36m'
-  GRN=$'\033[32m' YEL=$'\033[33m' RED=$'\033[31m' RST=$'\033[0m'
+  GRN=$'\033[32m' YEL=$'\033[33m' RED=$'\033[31m'
+  UNDERLINE=$'\033[4;58;5;8m' RST=$'\033[0m'
 else
-  BOLD='' DIM='' CYAN='' GRN='' YEL='' RED='' RST=''
+  BOLD='' DIM='' CYAN='' GRN='' YEL='' RED='' UNDERLINE='' RST=''
 fi
+
+# Print a device row, underlining the final row for its host. Reapply the
+# underline after color resets so it spans the full row.
+emit_device_row() {
+  local last=$1 format=$2 row plain padding reset_underlined
+  local sgr_pattern=$'\033''\[[0-9;]*m'
+  shift 2
+  printf -v row "$format" "$@"
+  if [ "$last" = 1 ] && [ -n "$UNDERLINE" ]; then
+    plain=$row
+    while [[ $plain =~ $sgr_pattern ]]; do
+      plain=${plain/"${BASH_REMATCH[0]}"/}
+    done
+    if [ -n "$COLS" ] && [ "$COLS" -gt "${#plain}" ]; then
+      printf -v padding '%*s' "$(( COLS - ${#plain} ))" ''
+      row+=$padding
+    fi
+    reset_underlined=${RST}${UNDERLINE}
+    row=${row//"$RST"/"$reset_underlined"}
+    printf '%s%s%s\n' "$UNDERLINE" "$row" "$RST"
+  else
+    printf '%s\n' "$row"
+  fi
+}
 
 # tint <value> <yellow-threshold> <red-threshold> -> sets $TINT
 tint() {
@@ -267,7 +292,12 @@ collect() {
 render() {
   printf "${BOLD}%-${HOSTW}s %-14s %5s %5s %7s %15s  %s${RST}\n" \
     HOST GPU UTIL TEMP POWER "MEM(used/total)" PROCS
+  host_row=0
+  host_count=${#HOSTS[@]}
   for h in "${HOSTS[@]}"; do
+    host_row=$(( host_row + 1 ))
+    underline_host=1
+    [ "$host_row" -eq "$host_count" ] && underline_host=0
     label=${h%'~tt'}; label=${label%'~mac'}
     if [ ! -f "$tmpdir/$h.ok" ]; then
       if [ -f "$tmpdir/$h.err" ]; then
@@ -291,8 +321,14 @@ render() {
     ssh_target "$h"
     if [ "$KIND" = tt ]; then
       first_device=1
+      device_row=0
+      device_count=$(jq -r '.devices | length' "$tmpdir/$h.ok" 2>/dev/null)
       while IFS=$'\t' read -r idx name temp power held mem_used mem_total procs; do
         [ -z "$idx" ] && continue
+        device_row=$(( device_row + 1 ))
+        last_device=0
+        [ "$underline_host" = 1 ] && [ "$device_count" -gt 1 ] \
+          && [ "$device_row" -eq "$device_count" ] && last_device=1
         if [ "$first_device" = 1 ]; then
           row_label=$label
           first_device=0
@@ -312,7 +348,7 @@ render() {
         else
           c_mem=$DIM; mem_display=$(printf '%15s' 'N/A')
         fi
-        printf "${CYAN}%-${HOSTW}s${RST} %-14s ${c_busy}%5s${RST} ${c_temp}%4sC${RST} %6sW ${c_mem}%s${RST}  %s%s\n" \
+        emit_device_row "$last_device" "${CYAN}%-${HOSTW}s${RST} %-14s ${c_busy}%5s${RST} ${c_temp}%4sC${RST} %6sW ${c_mem}%s${RST}  %s%s" \
           "$row_label" "TT${idx}/${name:0:10}" "$busy" "$temp_whole" "${power:-?}" "$mem_display" \
           "$staletag" "${procs:-${DIM}-${RST}}"
       done < <(jq -r --argjson sp "$SHOWPID" --argjson su "$SHOWUSER" '
@@ -354,7 +390,7 @@ render() {
             if (st) t=t "[" ago($4) "]"; out=out (out ? " " : "") t }
           END { print out }')
       procs=$(clip_procs "$pbudget" "$procs")
-      printf "${CYAN}%-${HOSTW}s${RST} %-14s ${c_util}%4s%%${RST} ${c_temp}%5s${RST} %6sW ${c_mem}%6sM/%7sM${RST}  %s%s\n" \
+      emit_device_row 0 "${CYAN}%-${HOSTW}s${RST} %-14s ${c_util}%4s%%${RST} ${c_temp}%5s${RST} %6sW ${c_mem}%6sM/%7sM${RST}  %s%s" \
         "$label" "${name:0:14}" "$util_whole" "$thermal" "$power" "$mused" "$mtotal" \
         "$staletag" "${procs:-${DIM}-${RST}}"
       continue
@@ -424,11 +460,17 @@ render() {
     read -r mused mtotal <<< "$mem"
     mempct=$(( mused * 100 / mtotal ))
     first_gpu=1
+    gpu_row=0
+    gpu_count=$(grep -cE '^[0-9]+,' <<< "$gpu")
     while IFS=',' read -r idx name util temp pdraw; do
       # nvidia-smi can print a device error before otherwise valid CSV rows
       # (for example when one GPU has fallen off the bus). Do not render that
       # diagnostic as an empty GPU record.
       [[ $idx =~ ^[0-9]+$ ]] || continue
+      gpu_row=$(( gpu_row + 1 ))
+      last_gpu=0
+      [ "$underline_host" = 1 ] && [ "$gpu_count" -gt 1 ] \
+        && [ "$gpu_row" -eq "$gpu_count" ] && last_gpu=1
       if [ "$first_gpu" = 1 ]; then
         row_label=$label
         first_gpu=0
@@ -442,7 +484,7 @@ render() {
       tint "$util" 30 70;   c_util=$TINT
       tint "$temp" 60 80;   c_temp=$TINT
       tint "$mempct" 60 85; c_mem=$TINT
-      printf "${CYAN}%-${HOSTW}s${RST} %-14s ${c_util}%4s%%${RST} ${c_temp}%4sC${RST} %6sW ${c_mem}%6sM/%7sM${RST}  %s%s\n" \
+      emit_device_row "$last_gpu" "${CYAN}%-${HOSTW}s${RST} %-14s ${c_util}%4s%%${RST} ${c_temp}%4sC${RST} %6sW ${c_mem}%6sM/%7sM${RST}  %s%s" \
         "$row_label" "${name:0:14}" "$util" "$temp" "$pdraw" "$mused" "$mtotal" \
         "$staletag" "${procs:-${DIM}-${RST}}"
     done <<< "$gpu"
