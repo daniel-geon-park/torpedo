@@ -422,6 +422,7 @@ render() {
         *) c_temp=$DIM; thermal=N/A ;;
       esac
       procs=$(sed -n '/^===PROC===$/,$p' "$tmpdir/$h.ok" | sed '1d' \
+        | sort -t'|' -k2,2nr \
         | awk -F'|' -v sp="$SHOWPID" -v su="$SHOWUSER" -v st="$SHOWTIME" '
           function ago(e) {
             if (e !~ /^[0-9]+$/) return "?"
@@ -526,6 +527,7 @@ render() {
       fi
       name=${name# } util=${util# } temp=${temp# } pdraw=${pdraw# }
       name=${name#NVIDIA }
+      name=${name/#Quadro /Qdro }
       name=${name#GeForce }
       # keep escapes in the format string, not the args — they'd break %-Ns widths
       tint "$util" 30 70;   c_util=$TINT
