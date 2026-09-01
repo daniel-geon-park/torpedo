@@ -1,0 +1,24 @@
+[Unit]
+Description=Persistent Tenstorrent device status HTTP server
+Documentation=file:///home/deepauto/torpedo/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deepauto
+Group=deepauto
+WorkingDirectory=/home/deepauto/torpedo
+ExecStart=/home/deepauto/torpedo/.venv/bin/torpedo --host 0.0.0.0 --port 8080 --interval 1 --backend luwen
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Basic hardening. Device and procfs access remain available to the monitor.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
