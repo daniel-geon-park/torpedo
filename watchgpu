@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+# gpustat — show accelerator status across CUDA and Tenstorrent servers
+set -u
+
+usage() {
+  cat <<'EOF'
+Usage: gpustat [-w [interval]] [-p] [-u] [[user@]host[:port][!tt|!mac] ...]
+
+Show GPU status (utilization, temperature, power, memory, processes)
+across servers over ssh. Append !tt for Tenstorrent or !mac for Apple Silicon.
+
+Options:
+  -w [interval]  watch mode: refresh every <interval> seconds (default 0.1)
+  -p             show the pid of each process
+  -u             show the owning user of each process
+  -t             show when each process was launched ('5m ago')
+  -h             show this help
+
+Processes that belong to one parent/child family share a color; the
+user and launch time (-u/-t) are only shown on the family's parent.
+
+At least one host must be supplied. Host defaults belong in the caller.
+ssh-config aliases, user@host, and user@host:port all work, e.g.:
+  gpustat dgx1 ubuntu@10.0.0.5:32123 p150a!tt mac1!mac
+EOF
+}
+
+WATCH=0
+INTERVAL=0.1
+SHOWPID=0
+SHOWUSER=0
+SHOWTIME=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    -w) WATCH=1; shift
+        if [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then INTERVAL=$1; shift; fi ;;
+    -p) SHOWPID=1; shift ;;
+    -u) SHOWUSER=1; shift ;;
+    -t) SHOWTIME=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) printf 'gpustat: unknown option %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
+    *)  break ;;
+  esac
+done
+
+if [ $# -eq 0 ]; then
+  printf 'gpustat: at least one host is required\n\n' >&2
+  usage >&2
+  exit 1
+fi
+HOSTS=("$@")
+
+# HOST column width: fit the longest address given
+HOSTW=4
+for h in "${HOSTS[@]}"; do
+  label=${h%'!tt'}; label=${label%'!mac'}
+  [ ${#label} -gt "$HOSTW" ] && HOSTW=${#label}
+done
+
+# GB10 has unified memory: nvidia-smi reports N/A for memory/power-limit,
+# so memory comes from `free` and we also list compute processes.
+REMOTE_CMD='
+nvidia-smi --query-gpu=index,name,utilization.gpu,temperature.gpu,power.draw \
+  --format=csv,noheader,nounits
+echo "===MEM==="
+free -m | awk "/^Mem:/{print \$3, \$2}"
+echo "===PROC==="
+nvidia-smi --query-compute-apps=pid,used_gpu_memory,process_name \
+  --format=csv,noheader,nounits 2>/dev/null \
+| while IFS=", " read -r pid pmem pname; do
+    set -- $(ps -o rss=,user:32=,etimes=,ppid= -p "$pid" 2>/dev/null)
+    # GB10 unified memory reports [N/A] per process -> fall back to RSS
+    case "$pmem" in ""|*[!0-9]*) pmem=$(( ${1:-0} / 1024 )) ;; esac
+    echo "$pid|$pmem|${2:-?}|${3:-?}|${4:-?}|${pname##*/}"
+  done
+'
+TT_REMOTE_CMD='curl --silent --show-error --fail --max-time 8 http://127.0.0.1:8080/v1/devices'
+MAC_REMOTE_CMD=$(cat <<'REMOTE'
+# Keep the timeout on the Mac, not only around ssh on the caller.  Killing a
+# timed-out ssh connection does not reliably kill its sudo child, and a stuck
+# powermetrics can otherwise remain in IOReportCreateSubscription indefinitely.
+# Run the sampler in a separate process group under a short-lived root
+# supervisor so both the sampler and any descendants receive TERM/KILL.  The
+# supervisor gives up after the final KILL rather than waiting forever on an
+# uninterruptible kernel call, so the ssh session itself is also bounded.
+sample=$(sudo -n /usr/bin/python3 - <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+argv = [
+    "/usr/bin/powermetrics",
+    "-i", "300",
+    "-n", "1",
+    "-s", "tasks,gpu_power,thermal",
+    "--show-process-gpu",
+    "-f", "text",
+]
+proc = subprocess.Popen(
+    argv,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    start_new_session=True,
+)
+try:
+    stdout, stderr = proc.communicate(timeout=4.0)
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        stdout, stderr = proc.communicate(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = proc.communicate(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+    sys.stderr.write("watchgpu: remote powermetrics timed out; TERM/KILL sent\n")
+    sys.exit(124)
+
+sys.stdout.write(stdout)
+sys.stderr.write(stderr)
+sys.exit(proc.returncode)
+PY
+) || exit $?
+util=$(printf "%s\n" "$sample" | sed -n "s/.*GPU HW active residency:[[:space:]]*\([0-9.]*\)%.*/\1/p" | tail -1)
+power_mw=$(printf "%s\n" "$sample" | awk "/^GPU Power:/{print \$3; exit}")
+thermal=$(printf "%s\n" "$sample" | awk -F": " "/^Current pressure level:/{print \$2; exit}")
+model=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || sysctl -n hw.model)
+mem_used=$(vm_stat | awk "
+  /page size of/ { page=\$8 }
+  /^Anonymous pages:|^Pages wired down:|^Pages occupied by compressor:/ {
+    gsub(/\\./, \"\", \$NF); pages += \$NF
+  }
+  END { printf \"%.0f\", pages*page/1048576 }")
+mem_total=$(( $(sysctl -n hw.memsize) / 1048576 ))
+printf "===MAC===\n%s|%s|%s|%s|%s|%s\n===PROC===\n" "$model" "${util:-0}" "${thermal:-Unknown}" "${power_mw:-0}" "$mem_used" "$mem_total"
+ioreg -r -c AGXDeviceUserClient -l 2>/dev/null \
+| grep "IOUserClientCreator" \
+| while read -r key equals pid_word pid hint; do
+    pid=${pid%,}; hint=${hint%\"}
+    case $hint in
+      runningboardd|WindowServer|SecurityAgent|loginwindow|CursorUIViewServ) continue ;;
+    esac
+    set -- $(ps -o user=,etime=,ppid=,comm= -p "$pid" 2>/dev/null)
+    user=${1:-?}; elapsed=${2:-?}; ppid=${3:-?}; name=${4##*/}
+    elapsed_s=$(awk -v s="$elapsed" "BEGIN {
+      days=0; if (index(s, \"-\")) { split(s,d,\"-\"); days=d[1]; s=d[2] }
+      n=split(s,t,\":\"); if (n==3) { h=t[1]; m=t[2]; sec=t[3] }
+      else { h=0; m=t[1]; sec=t[2] }
+      print days*86400+h*3600+m*60+sec
+    }")
+    printf "%s|0|%s|%s|%s|%s\n" "$pid" "$user" "${elapsed_s:-?}" "$ppid" "${name:-$hint}"
+  done
+REMOTE
+)
+# ControlMaster keeps one SSH connection per host alive across polls,
+# so watch mode isn't paying a handshake on every refresh.
+# ServerAlive kills an established connection whose peer died (~4s) —
+# without it a shut-down host leaves the multiplexed socket hanging.
+SSH_OPTS=(-o ConnectTimeout=5 -o BatchMode=yes
+          -o ServerAliveInterval=2 -o ServerAliveCountMax=2
+          -o ControlMaster=auto -o ControlPersist=60
+          -o ControlPath="$HOME/.ssh/gpustat-%r@%h:%p")
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+# colors only on a tty, and not when NO_COLOR is set
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  BOLD=$'\033[1m' DIM=$'\033[2m' CYAN=$'\033[36m'
+  GRN=$'\033[32m' YEL=$'\033[33m' RED=$'\033[31m' RST=$'\033[0m'
+else
+  BOLD='' DIM='' CYAN='' GRN='' YEL='' RED='' RST=''
+fi
+
+# tint <value> <yellow-threshold> <red-threshold> -> sets $TINT
+tint() {
+  if   [ "$1" -ge "$3" ]; then TINT=$RED
+  elif [ "$1" -ge "$2" ]; then TINT=$YEL
+  else TINT=$GRN; fi
+}
+
+# terminal width; empty when there is no tty (then no truncation happens).
+# read via /dev/tty because render() runs inside $() where stdout is a pipe
+term_cols() { { stty size </dev/tty; } 2>/dev/null | awk '{print $2}'; }
+COLS=$(term_cols)
+
+# fit_cols <used-width> <text>: ellipsize text so used+text fits in $COLS
+fit_cols() {
+  local avail text=$2
+  if [ -n "$COLS" ] && [ "$COLS" -gt 0 ]; then
+    avail=$(( COLS - $1 ))
+    if [ ${#text} -gt "$avail" ]; then
+      [ "$avail" -lt 1 ] && avail=1
+      text="${text:0:avail-1}…"
+    fi
+  fi
+  printf '%s' "$text"
+}
+
+# Truncate an uncolored process list to the same visible-width budget used by
+# the DGX renderer. Keep the final column for an ellipsis.
+clip_procs() {
+  local budget=$1 text=$2
+  if [ ${#text} -le "$budget" ]; then
+    printf '%s' "$text"
+  elif [ "$budget" -le 1 ]; then
+    printf '…'
+  else
+    printf '%s…' "${text:0:budget-1}"
+  fi
+}
+
+# split [user@]host[:port] into ssh target + optional -p flag
+ssh_target() {
+  TARGET=$1 PORT= KIND=cuda
+  if [[ $TARGET == *'!tt' ]]; then
+    KIND=tt TARGET=${TARGET%'!tt'}
+  elif [[ $TARGET == *'!mac' ]]; then
+    KIND=mac TARGET=${TARGET%'!mac'}
+  fi
+  if [[ $TARGET == *:* && ${TARGET##*:} =~ ^[0-9]+$ ]]; then
+    PORT=${TARGET##*:} TARGET=${TARGET%:*}
+  fi
+}
+
+# poll one host once; `timeout` bounds even a pathologically hung ssh.
+# results are written via mv so render never sees a half-written file
+poll_once() {
+  local h=$1 out rc
+  ssh_target "$h"
+  if [ "$KIND" = tt ]; then
+    out=$(timeout 10 ssh "${SSH_OPTS[@]}" ${PORT:+-p "$PORT"} "$TARGET" "$TT_REMOTE_CMD" 2>&1)
+  elif [ "$KIND" = mac ]; then
+    out=$(timeout 10 ssh "${SSH_OPTS[@]}" ${PORT:+-p "$PORT"} "$TARGET" "$MAC_REMOTE_CMD" 2>&1)
+  else
+    out=$(timeout 10 ssh "${SSH_OPTS[@]}" ${PORT:+-p "$PORT"} "$TARGET" "$REMOTE_CMD" 2>&1)
+  fi
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "$out" > "$tmpdir/$h.tmp" && mv -f "$tmpdir/$h.tmp" "$tmpdir/$h.ok"
+    rm -f "$tmpdir/$h.err"
+  else
+    [ "$rc" -eq 124 ] && out="ssh timed out"
+    printf '%s\n' "$out" | tail -1 > "$tmpdir/$h.tmp" && mv -f "$tmpdir/$h.tmp" "$tmpdir/$h.err"
+    rm -f "$tmpdir/$h.ok"
+  fi
+}
+
+collect() {
+  for h in "${HOSTS[@]}"; do poll_once "$h" & done
+  wait
+}
+
+render() {
+  printf "${BOLD}%-${HOSTW}s %-14s %5s %5s %7s %15s  %s${RST}\n" \
+    HOST GPU UTIL TEMP POWER "MEM(used/total)" PROCS
+  for h in "${HOSTS[@]}"; do
+    label=${h%'!tt'}; label=${label%'!mac'}
+    if [ ! -f "$tmpdir/$h.ok" ]; then
+      if [ -f "$tmpdir/$h.err" ]; then
+        printf "${CYAN}%-${HOSTW}s${RST} ${RED}UNREACHABLE: %s${RST}\n" \
+          "$label" "$(fit_cols $(( HOSTW + 14 )) "$(cat "$tmpdir/$h.err")")"
+      else
+        printf "${CYAN}%-${HOSTW}s${RST} ${DIM}connecting…${RST}\n" "$label"
+      fi
+      continue
+    fi
+    # flag rows whose poller has stopped delivering (host mid-shutdown etc.)
+    age=$(( $(date +%s) - $(stat -c %Y "$tmpdir/$h.ok") ))
+    staletag=''
+    [ "$age" -ge 5 ] && staletag="[${age}s ago] "
+    if [ -n "$COLS" ] && [ "$COLS" -gt 0 ]; then
+      pbudget=$(( COLS - HOSTW - 54 - ${#staletag} ))
+      [ "$pbudget" -lt 1 ] && pbudget=1
+    else
+      pbudget=100000
+    fi
+    ssh_target "$h"
+    if [ "$KIND" = tt ]; then
+      while IFS=$'\t' read -r idx name temp power held mem_used mem_total procs; do
+        [ -z "$idx" ] && continue
+        procs=$(clip_procs "$pbudget" "$procs")
+        if [ "$held" = true ]; then busy=HELD; c_busy=$YEL; else busy=idle; c_busy=$GRN; fi
+        case $temp in
+          ''|*[!0-9.]*) c_temp=$DIM; temp_whole=${temp:-?} ;;
+          *) temp_whole=$(printf '%.0f' "$temp"); tint "$temp_whole" 60 80; c_temp=$TINT ;;
+        esac
+        if [ "$mem_used" -ge 0 ] 2>/dev/null && [ "$mem_total" -gt 0 ] 2>/dev/null; then
+          mused=$(( mem_used / 1048576 )); mtotal=$(( mem_total / 1048576 ))
+          mempct=$(( mem_used * 100 / mem_total )); tint "$mempct" 60 85; c_mem=$TINT
+          mem_display=$(printf '%6sM/%7sM' "$mused" "$mtotal")
+        else
+          c_mem=$DIM; mem_display=$(printf '%15s' 'N/A')
+        fi
+        printf "${CYAN}%-${HOSTW}s${RST} %-14s ${c_busy}%5s${RST} ${c_temp}%4sC${RST} %6sW ${c_mem}%s${RST}  %s%s\n" \
+          "$label" "TT${idx}/${name:0:10}" "$busy" "$temp_whole" "${power:-?}" "$mem_display" \
+          "$staletag" "${procs:-${DIM}-${RST}}"
+      done < <(jq -r --argjson sp "$SHOWPID" --argjson su "$SHOWUSER" '
+        .devices[] | [
+          (.index|tostring), (.board_info.board_type // "Tenstorrent"),
+          (.telemetry.asic_temperature // "?"), (.telemetry.board_power // "?"),
+          (.held|tostring),
+          ((.memory_usage_bytes // -1)|tostring), ((.memory_total_bytes // -1)|tostring),
+          ([.processes[] | (.cmdline | split(" ")[0] | split("/")[-1])
+            + (if $sp == 1 then "(" + (.pid|tostring) + ")" else "" end)
+            + (if $su == 1 then "[" + .user + "]" else "" end)] | join(" "))
+        ] | @tsv' "$tmpdir/$h.ok" 2>/dev/null)
+      continue
+    fi
+    if [ "$KIND" = mac ]; then
+      IFS='|' read -r name util thermal power_mw mused mtotal \
+        < <(sed -n '/^===MAC===$/{n;p;}' "$tmpdir/$h.ok")
+      util_whole=$(printf '%.0f' "${util:-0}")
+      power=$(awk -v mw="${power_mw:-0}" 'BEGIN{printf "%.2f", mw/1000}')
+      mempct=$(( mused * 100 / mtotal ))
+      tint "$util_whole" 30 70; c_util=$TINT
+      tint "$mempct" 60 85; c_mem=$TINT
+      case $thermal in
+        Nominal) c_temp=$GRN; thermal=Nom ;;
+        Moderate) c_temp=$YEL; thermal=Mod ;;
+        Heavy|Trapping) c_temp=$RED; thermal=${thermal:0:4} ;;
+        *) c_temp=$DIM; thermal=N/A ;;
+      esac
+      procs=$(sed -n '/^===PROC===$/,$p' "$tmpdir/$h.ok" | sed '1d' \
+        | awk -F'|' -v sp="$SHOWPID" -v su="$SHOWUSER" -v st="$SHOWTIME" '
+          function ago(e) {
+            if (e !~ /^[0-9]+$/) return "?"
+            if (e < 60) return e "s ago"
+            if (e < 3600) return int(e/60) "m ago"
+            if (e < 86400) return int(e/3600) "h ago"
+            return int(e/86400) "d ago"
+          }
+          { t=$6; if (sp) t=t "(" $1 ")"; if (su) t=t "[" $3 "]";
+            if (st) t=t "[" ago($4) "]"; out=out (out ? " " : "") t }
+          END { print out }')
+      procs=$(clip_procs "$pbudget" "$procs")
+      printf "${CYAN}%-${HOSTW}s${RST} %-14s ${c_util}%4s%%${RST} ${c_temp}%5s${RST} %6sW ${c_mem}%6sM/%7sM${RST}  %s%s\n" \
+        "$label" "${name:0:14}" "$util_whole" "$thermal" "$power" "$mused" "$mtotal" \
+        "$staletag" "${procs:-${DIM}-${RST}}"
+      continue
+    fi
+    gpu=$(sed -n '1,/^===MEM===$/p' "$tmpdir/$h.ok" | sed '$d')
+    mem=$(sed -n '/^===MEM===$/,/^===PROC===$/p' "$tmpdir/$h.ok" | sed '1d;$d')
+    # procs carry their own per-family colors, so the width budget is
+    # enforced here (on visible chars, at token boundaries), not by fit_cols
+    # remote sends "pid|memMB|user|etimes|ppid|name" per process
+    procs=$(sed -n '/^===PROC===$/,$p' "$tmpdir/$h.ok" | sed '1d' \
+            | sort -t'|' -k2,2nr \
+            | awk -F'|' -v sp="$SHOWPID" -v su="$SHOWUSER" -v st="$SHOWTIME" \
+                  -v budget="$pbudget" -v use_color="${RST:+1}" '
+        function ago(e) {
+          if (e !~ /^[0-9]+$/) return "?"
+          if (e < 60)    return e "s ago"
+          if (e < 3600)  return int(e/60) "m ago"
+          if (e < 86400) return int(e/3600) "h ago"
+          return int(e/86400) "d ago"
+        }
+        { pid[NR]=$1; mem[NR]=$2; usr[NR]=$3; et[NR]=$4; pp[NR]=$5; nm[NR]=$6
+          idx[$1] = NR }
+        END {
+          if (!NR) exit
+          # family root: follow ppid links within the displayed set
+          for (i = 1; i <= NR; i++) {
+            r = i
+            for (s = 0; s < NR && (pp[r] in idx) && idx[pp[r]] != r; s++)
+              r = idx[pp[r]]
+            root[i] = r; members[r]++
+          }
+          # one palette color per multi-process family, in display order
+          nc = split("95 94 96 92 91 93", pal, " ")
+          for (i = 1; i <= NR; i++) {
+            r = root[i]
+            if (members[r] > 1 && !(r in fam)) fam[r] = pal[(nfam++ % nc) + 1]
+          }
+          out = ""; used = 0
+          for (i = 1; i <= NR; i++) {
+            child = (root[i] != i)
+            t = (mem[i] == "") ? "?" : mem[i] "M"
+            if (sp) t = t ", " pid[i]
+            # user and launch time are the parents anyway -> hide on children
+            if (su && !child) t = t ", " usr[i]
+            if (st && !child) t = t ", " ago(et[i])
+            tok = nm[i] "(" t ")"
+            c = (root[i] in fam) ? fam[root[i]] : 2
+            need = length(tok) + (out == "" ? 0 : 1)
+            rem = budget - used
+            # keep one column spare for the ellipsis unless this token is last
+            if ((i < NR && need > rem - 1) || need > rem) {
+              # char-cut a stub of this token into whatever space remains
+              stub_w = rem - 1 - (out == "" ? 0 : 1)
+              if (stub_w > 3) {
+                stub = substr(tok, 1, stub_w)
+                if (use_color) stub = "\033[" c "m" stub "\033[0m"
+                out = out (out == "" ? "" : " ") stub
+              }
+              out = out "…"; break
+            }
+            if (use_color) tok = "\033[" c "m" tok "\033[0m"
+            out = out (out == "" ? "" : " ") tok
+            used += need
+          }
+          print out
+        }')
+    read -r mused mtotal <<< "$mem"
+    mempct=$(( mused * 100 / mtotal ))
+    while IFS=',' read -r idx name util temp pdraw; do
+      name=${name# } util=${util# } temp=${temp# } pdraw=${pdraw# }
+      # keep escapes in the format string, not the args — they'd break %-Ns widths
+      tint "$util" 30 70;   c_util=$TINT
+      tint "$temp" 60 80;   c_temp=$TINT
+      tint "$mempct" 60 85; c_mem=$TINT
+      printf "${CYAN}%-${HOSTW}s${RST} %-14s ${c_util}%4s%%${RST} ${c_temp}%4sC${RST} %6sW ${c_mem}%6sM/%7sM${RST}  %s%s\n" \
+        "$label" "${name:0:14}" "$util" "$temp" "$pdraw" "$mused" "$mtotal" \
+        "$staletag" "${procs:-${DIM}-${RST}}"
+    done <<< "$gpu"
+  done
+}
+
+if [ "$WATCH" = 0 ]; then
+  collect
+  render
+  exit
+fi
+
+# watch mode: repaint in place (cursor home + clear-below) to avoid flicker.
+# each host is polled by its own background loop so one dead/hanging host
+# can never freeze the display — its row just goes UNREACHABLE/stale while
+# the others keep refreshing
+tput civis 2>/dev/null
+# jobs -p is unreliable inside a trap's command substitution — track pids
+POLLERS=()
+trap 'tput cnorm 2>/dev/null; kill "${POLLERS[@]}" 2>/dev/null; rm -rf "$tmpdir"; exit' INT TERM EXIT
+printf '\033[2J'
+for h in "${HOSTS[@]}"; do
+  ( while :; do poll_once "$h"; sleep "$INTERVAL"; done ) &
+  POLLERS+=($!)
+done
+while true; do
+  COLS=$(term_cols)   # track live terminal resizes
+  frame=$(render)
+  # \033[K after every line: a shorter line must wipe the tail of the old
+  # one, or stale text (e.g. a killed process) lingers on screen
+  frame=${frame//$'\n'/$'\033[K\n'}
+  printf '\033[H%s\033[K\n' "$frame"
+  printf 'every %ss  %s  (Ctrl-C to quit)\033[K\n\033[0J' \
+    "$INTERVAL" "$(date +%T)"
+  # background sleep + wait: a signal interrupts wait immediately, while a
+  # foreground sleep would delay the cleanup trap by up to one interval
+  sleep "$INTERVAL" & wait $!
+done
