@@ -74,7 +74,39 @@ nvidia-smi --query-compute-apps=pid,used_gpu_memory,process_name \
     echo "$pid|$pmem|${2:-?}|${3:-?}|${4:-?}|${pname##*/}"
   done
 '
-TT_REMOTE_CMD='curl --silent --show-error --fail --max-time 8 http://127.0.0.1:8080/v1/devices'
+TT_REMOTE_CMD=$(cat <<'REMOTE'
+python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.request
+
+with urllib.request.urlopen("http://127.0.0.1:8080/v1/devices", timeout=8) as response:
+    payload = json.load(response)
+
+try:
+    with open("/proc/uptime", encoding="ascii") as stream:
+        uptime = float(stream.read().split()[0])
+    clock_ticks = os.sysconf("SC_CLK_TCK")
+except (OSError, ValueError):
+    uptime = clock_ticks = None
+
+if uptime is not None:
+    for device in payload.get("devices", []):
+        for process in device.get("processes", []):
+            try:
+                with open(f"/proc/{process['pid']}/stat", encoding="ascii") as stream:
+                    fields = stream.read().rsplit(")", 1)[1].split()
+                process["elapsed_seconds"] = max(
+                    0, int(uptime - int(fields[19]) / clock_ticks)
+                )
+            except (OSError, ValueError, IndexError, KeyError):
+                pass
+
+json.dump(payload, sys.stdout, separators=(",", ":"))
+PY
+REMOTE
+)
 MAC_REMOTE_CMD=$(cat <<'REMOTE'
 # Keep the timeout on the Mac, not only around ssh on the caller.  Killing a
 # timed-out ssh connection does not reliably kill its sudo child, and a stuck
@@ -149,15 +181,15 @@ ioreg -r -c AGXDeviceUserClient -l 2>/dev/null \
     case $hint in
       runningboardd|WindowServer|SecurityAgent|loginwindow|CursorUIViewServ) continue ;;
     esac
-    set -- $(ps -o user=,etime=,ppid=,comm= -p "$pid" 2>/dev/null)
-    user=${1:-?}; elapsed=${2:-?}; ppid=${3:-?}; name=${4##*/}
+    set -- $(ps -o rss=,user=,etime=,ppid=,comm= -p "$pid" 2>/dev/null)
+    rss=${1:-0}; user=${2:-?}; elapsed=${3:-?}; ppid=${4:-?}; name=${5##*/}
     elapsed_s=$(awk -v s="$elapsed" "BEGIN {
       days=0; if (index(s, \"-\")) { split(s,d,\"-\"); days=d[1]; s=d[2] }
       n=split(s,t,\":\"); if (n==3) { h=t[1]; m=t[2]; sec=t[3] }
       else { h=0; m=t[1]; sec=t[2] }
       print days*86400+h*3600+m*60+sec
     }")
-    printf "%s|0|%s|%s|%s|%s\n" "$pid" "$user" "${elapsed_s:-?}" "$ppid" "${name:-$hint}"
+    printf "%s|%s|%s|%s|%s|%s\n" "$pid" "$(( rss / 1024 ))" "$user" "${elapsed_s:-?}" "$ppid" "${name:-$hint}"
   done
 REMOTE
 )
@@ -351,15 +383,27 @@ render() {
         emit_device_row "$last_device" "${CYAN}%-${HOSTW}s${RST} %-14s ${c_busy}%5s${RST} ${c_temp}%4sC${RST} %6sW ${c_mem}%s${RST}  %s%s" \
           "$row_label" "TT${idx}/${name:0:10}" "$busy" "$temp_whole" "${power:-?}" "$mem_display" \
           "$staletag" "${procs:-${DIM}-${RST}}"
-      done < <(jq -r --argjson sp "$SHOWPID" --argjson su "$SHOWUSER" '
+      done < <(jq -r --argjson sp "$SHOWPID" --argjson su "$SHOWUSER" --argjson st "$SHOWTIME" '
+        def ago:
+          if . == null then "?"
+          elif . < 60 then (floor|tostring) + "s ago"
+          elif . < 3600 then (./60|floor|tostring) + "m ago"
+          elif . < 86400 then (./3600|floor|tostring) + "h ago"
+          else (./86400|floor|tostring) + "d ago"
+          end;
         .devices[] | [
           (.index|tostring), (.board_info.board_type // "Tenstorrent"),
           (.telemetry.asic_temperature // "?"), (.telemetry.board_power // "?"),
           (.held|tostring),
           ((.memory_usage_bytes // -1)|tostring), ((.memory_total_bytes // -1)|tostring),
-          ([.processes[] | (.cmdline | split(" ")[0] | split("/")[-1])
-            + (if $sp == 1 then "(" + (.pid|tostring) + ")" else "" end)
-            + (if $su == 1 then "[" + .user + "]" else "" end)] | join(" "))
+          ([.processes[] | . as $p
+            | (($p.cmdline // "?") | split(" ")[0] | split("/")[-1]) + "("
+            + (if $p.memory_usage_bytes == null then "?M"
+               else (($p.memory_usage_bytes/1048576|floor|tostring) + "M") end)
+            + (if $sp == 1 then ", " + ($p.pid|tostring) else "" end)
+            + (if $su == 1 then ", " + ($p.user // "?") else "" end)
+            + (if $st == 1 then ", " + (($p.elapsed_seconds // null) | ago) else "" end)
+            + ")"] | join(" "))
         ] | @tsv' "$tmpdir/$h.ok" 2>/dev/null)
       continue
     fi
@@ -386,8 +430,11 @@ render() {
             if (e < 86400) return int(e/3600) "h ago"
             return int(e/86400) "d ago"
           }
-          { t=$6; if (sp) t=t "(" $1 ")"; if (su) t=t "[" $3 "]";
-            if (st) t=t "[" ago($4) "]"; out=out (out ? " " : "") t }
+          { details=($2 == "" || $2 == "?" ? "?M" : $2 "M")
+            if (sp) details=details ", " $1
+            if (su) details=details ", " $3
+            if (st) details=details ", " ago($4)
+            t=$6 "(" details ")"; out=out (out ? " " : "") t }
           END { print out }')
       procs=$(clip_procs "$pbudget" "$procs")
       emit_device_row 0 "${CYAN}%-${HOSTW}s${RST} %-14s ${c_util}%4s%%${RST} ${c_temp}%5s${RST} %6sW ${c_mem}%6sM/%7sM${RST}  %s%s" \
