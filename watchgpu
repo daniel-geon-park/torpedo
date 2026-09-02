@@ -60,7 +60,7 @@ done
 # GB10 has unified memory: nvidia-smi reports N/A for memory/power-limit,
 # so memory comes from `free` and we also list compute processes.
 REMOTE_CMD='
-nvidia-smi --query-gpu=index,name,utilization.gpu,temperature.gpu,power.draw \
+nvidia-smi --query-gpu=index,name,utilization.gpu,temperature.gpu,power.draw,memory.used,memory.total \
   --format=csv,noheader,nounits
 echo "===MEM==="
 free -m | awk "/^Mem:/{print \$3, \$2}"
@@ -83,6 +83,12 @@ import urllib.request
 
 with urllib.request.urlopen("http://127.0.0.1:8080/v1/devices", timeout=8) as response:
     payload = json.load(response)
+
+if payload.get("state") != "ready":
+    state = payload.get("state", "unknown")
+    error = str(payload.get("error") or "telemetry unavailable").strip()
+    sys.stderr.write(f"torpedo {state}: {error}\n")
+    sys.exit(1)
 
 try:
     with open("/proc/uptime", encoding="ascii") as stream:
@@ -505,12 +511,11 @@ render() {
           }
           print out
         }')
-    read -r mused mtotal <<< "$mem"
-    mempct=$(( mused * 100 / mtotal ))
+    read -r host_mused host_mtotal <<< "$mem"
     first_gpu=1
     gpu_row=0
     gpu_count=$(grep -cE '^[0-9]+,' <<< "$gpu")
-    while IFS=',' read -r idx name util temp pdraw; do
+    while IFS=',' read -r idx name util temp pdraw gpu_mused gpu_mtotal; do
       # nvidia-smi can print a device error before otherwise valid CSV rows
       # (for example when one GPU has fallen off the bus). Do not render that
       # diagnostic as an empty GPU record.
@@ -526,9 +531,20 @@ render() {
         row_label=' --'
       fi
       name=${name# } util=${util# } temp=${temp# } pdraw=${pdraw# }
+      gpu_mused=${gpu_mused# } gpu_mtotal=${gpu_mtotal# }
       name=${name#NVIDIA }
       name=${name/#Quadro /Qdro }
       name=${name#GeForce }
+      if [[ $gpu_mused =~ ^[0-9]+$ && $gpu_mtotal =~ ^[0-9]+$ ]] \
+          && [ "$gpu_mtotal" -gt 0 ]; then
+        mused=$gpu_mused
+        mtotal=$gpu_mtotal
+      else
+        # Unified-memory GPUs such as GB10 report N/A here; use host memory.
+        mused=$host_mused
+        mtotal=$host_mtotal
+      fi
+      mempct=$(( mused * 100 / mtotal ))
       # keep escapes in the format string, not the args — they'd break %-Ns widths
       tint "$util" 30 70;   c_util=$TINT
       tint "$temp" 60 80;   c_temp=$TINT

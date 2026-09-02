@@ -48,10 +48,14 @@ class DeviceMonitor:
         self,
         interval: float = 1.0,
         backend_factory: Callable[[], Any] = create_tt_smi_backend,
+        recovery_max_interval: float = 30.0,
     ) -> None:
         if interval <= 0:
             raise ValueError("interval must be positive")
+        if recovery_max_interval <= 0:
+            raise ValueError("recovery_max_interval must be positive")
         self.interval = interval
+        self.recovery_max_interval = max(interval, recovery_max_interval)
         self.backend_factory = backend_factory
         self._backend: Any | None = None
         self._snapshot: dict[str, Any] = self._empty_snapshot("initializing")
@@ -92,26 +96,51 @@ class DeviceMonitor:
         with self._lock:
             self._snapshot = value
 
-    def _run(self) -> None:
-        try:
-            # This is deliberately called exactly once per server process.
-            self._backend = self.backend_factory()
-            self._refresh(initial=True)
-        except Exception as exc:
-            LOG.exception("Tenstorrent context initialization failed")
-            self._publish(self._empty_snapshot("initialization_error", str(exc)))
-            return
+    def _publish_recovering(self, exc: Exception) -> None:
+        previous = self.snapshot()
+        value = self._empty_snapshot("recovering", str(exc))
+        value["last_refresh_attempt_at"] = value["sampled_at"]
+        last_successful_sample_at = previous.get("last_successful_sample_at")
+        if previous.get("state") == "ready":
+            last_successful_sample_at = previous.get("sampled_at")
+        if last_successful_sample_at is not None:
+            value["last_successful_sample_at"] = last_successful_sample_at
+        self._publish(value)
 
-        while not self._stop.wait(self.interval):
+    def _run(self) -> None:
+        retry_interval = self.interval
+        recovering = False
+        while not self._stop.is_set():
+            initializing = self._backend is None
             try:
-                self._refresh(initial=False)
+                if initializing:
+                    self._backend = self.backend_factory()
+                    self._refresh(initial=True)
+                else:
+                    self._refresh(initial=False)
             except Exception as exc:
-                LOG.exception("Tenstorrent telemetry refresh failed")
-                previous = self.snapshot()
-                previous["state"] = "refresh_error"
-                previous["error"] = str(exc)
-                previous["last_refresh_attempt_at"] = self._now()
-                self._publish(previous)
+                phase = "context initialization" if initializing else "telemetry refresh"
+                LOG.exception(
+                    "Tenstorrent %s failed; rediscovering in %.1fs",
+                    phase,
+                    retry_interval,
+                )
+                # A device reset invalidates the PciChip/TTDevice objects held by
+                # TTSMIBackend. Drop the complete context before rediscovery.
+                self._backend = None
+                self._publish_recovering(exc)
+                recovering = True
+                if self._stop.wait(retry_interval):
+                    return
+                retry_interval = min(retry_interval * 2, self.recovery_max_interval)
+                continue
+
+            if recovering:
+                LOG.info("Tenstorrent context rediscovered; telemetry recovered")
+                recovering = False
+            retry_interval = self.interval
+            if self._stop.wait(self.interval):
+                return
 
     def _refresh(self, initial: bool) -> None:
         assert self._backend is not None

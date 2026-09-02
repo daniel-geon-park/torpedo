@@ -4,6 +4,11 @@
 telemetry in a background thread, and serves the most recent sample as JSON.
 HTTP requests never initialize hardware and never wait for a telemetry read.
 
+If a device reset invalidates the active hardware context, torpedo discards it
+and repeats discovery with exponential backoff (up to 30 seconds). While it is
+recovering, health checks return 503 and the snapshot contains no stale device
+values. Normal sampling resumes automatically once discovery succeeds.
+
 ## Run
 
 ```sh

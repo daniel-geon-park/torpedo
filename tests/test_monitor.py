@@ -1,5 +1,6 @@
-import time
 import os
+import threading
+import time
 
 from torpedo.monitor import DeviceMonitor
 
@@ -23,6 +24,13 @@ class FakeBackend:
         {"pid":%d,"user":"test","device":0,"cmdline":"torpedo"}]}''' % os.getpid()
 
 
+def wait_until(predicate, timeout=1):
+    deadline = time.time() + timeout
+    while not predicate() and time.time() < deadline:
+        time.sleep(0.005)
+    assert predicate()
+
+
 def test_initializes_once_and_publishes_device_status():
     calls = 0
     backend = FakeBackend()
@@ -35,9 +43,7 @@ def test_initializes_once_and_publishes_device_status():
     monitor = DeviceMonitor(interval=0.01, backend_factory=factory)
     monitor.start()
     try:
-        deadline = time.time() + 1
-        while monitor.snapshot()["state"] != "ready" and time.time() < deadline:
-            time.sleep(0.005)
+        wait_until(lambda: monitor.snapshot()["state"] == "ready")
         snapshot = monitor.snapshot()
         assert calls == 1
         assert snapshot["devices"][0]["held"] is True
@@ -47,12 +53,73 @@ def test_initializes_once_and_publishes_device_status():
         monitor.stop()
 
 
-def test_initialization_failure_is_reported():
-    def factory():
-        raise RuntimeError("broken")
+def test_initialization_failure_is_retried():
+    calls = 0
+    backend = FakeBackend()
 
-    monitor = DeviceMonitor(interval=1, backend_factory=factory)
+    def factory():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("broken")
+        return backend
+
+    monitor = DeviceMonitor(
+        interval=0.01,
+        recovery_max_interval=0.02,
+        backend_factory=factory,
+    )
     monitor.start()
-    monitor._thread.join(timeout=1)
-    assert monitor.snapshot()["state"] == "initialization_error"
-    assert monitor.snapshot()["error"] == "broken"
+    try:
+        wait_until(lambda: calls >= 2 and monitor.snapshot()["state"] == "ready")
+        assert monitor.snapshot()["error"] is None
+    finally:
+        monitor.stop()
+
+
+def test_refresh_failure_discards_stale_backend_and_recovers():
+    class ResetBackend(FakeBackend):
+        def update_telem(self):
+            raise RuntimeError("Ioctl failed with ENODEV")
+
+    calls = 0
+    stale_backend = ResetBackend()
+    recovered_backend = FakeBackend()
+    recovery_attempted = threading.Event()
+    allow_recovery = threading.Event()
+
+    def factory():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return stale_backend
+        recovery_attempted.set()
+        allow_recovery.wait(timeout=1)
+        return recovered_backend
+
+    monitor = DeviceMonitor(
+        interval=0.01,
+        recovery_max_interval=0.02,
+        backend_factory=factory,
+    )
+    monitor.start()
+    try:
+        wait_until(lambda: recovery_attempted.is_set())
+        recovering = monitor.snapshot()
+        assert recovering["state"] == "recovering"
+        assert recovering["devices"] == []
+        assert recovering["error"] == "Ioctl failed with ENODEV"
+        assert "last_successful_sample_at" in recovering
+
+        allow_recovery.set()
+        wait_until(
+            lambda: calls >= 2
+            and recovered_backend.refreshes >= 1
+            and monitor.snapshot()["state"] == "ready"
+        )
+        snapshot = monitor.snapshot()
+        assert snapshot["error"] is None
+        assert snapshot["devices"][0]["telemetry"]["aiclk"] == 1000
+    finally:
+        allow_recovery.set()
+        monitor.stop()
