@@ -73,5 +73,9 @@ def physical_dram_bytes(device_info: dict) -> int | None:
     if len(channels) == 8:
         enabled = sum(bool(channel.get("enabled")) for channel in channels)
         return enabled * 4 * 1024**3
+    # The passive backend deliberately never opens a device to query channel
+    # state. P150 cards have eight fixed 4-GiB Blackhole GDDR channels.
+    board_type = str(device_info.get("board_info", {}).get("board_type", "")).lower()
+    if board_type in {"p150", "p150a", "p150b"}:
+        return 32 * 1024**3
     return None
-

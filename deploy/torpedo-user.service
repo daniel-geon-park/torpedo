@@ -1,0 +1,17 @@
+[Unit]
+Description=Persistent Tenstorrent device status HTTP server
+Documentation=file://%h/torpedo/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/torpedo
+ExecStart=/usr/bin/python3 -m torpedo.server --host 0.0.0.0 --port 8080 --interval 1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

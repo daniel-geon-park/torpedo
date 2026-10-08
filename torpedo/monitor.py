@@ -10,44 +10,20 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from torpedo.memory import physical_dram_bytes, read_memory_stats
+from torpedo.passive import PassiveBackend
 
 LOG = logging.getLogger(__name__)
 
 
-def create_tt_smi_backend(backend: str = "luwen") -> Any:
-    """Discover devices once and retain the resulting hardware context."""
-    from tt_smi.backend import TTSMIBackend
-
-    if backend == "umd":
-        from tt_smi import constants
-        from tt_umd import TopologyDiscovery
-
-        descriptor, devices = TopologyDiscovery.discover(
-            options=constants.get_default_discovery_options()
-        )
-    elif backend == "luwen":
-        from tt_tools_common.utils_common.tools_utils import detect_chips_with_callback
-
-        descriptor = None
-        devices = dict(
-            enumerate(detect_chips_with_callback(print_status=False))
-        )
-    else:
-        raise ValueError(f"unknown backend: {backend}")
-    if not devices:
-        raise RuntimeError("no Tenstorrent devices detected")
-    return TTSMIBackend(
-        devices=devices,
-        umd_cluster_descriptor=descriptor,
-        pretty_output=False,
-    )
+def create_passive_backend() -> PassiveBackend:
+    return PassiveBackend()
 
 
 class DeviceMonitor:
     def __init__(
         self,
         interval: float = 1.0,
-        backend_factory: Callable[[], Any] = create_tt_smi_backend,
+        backend_factory: Callable[[], Any] = create_passive_backend,
         recovery_max_interval: float = 30.0,
     ) -> None:
         if interval <= 0:
@@ -186,8 +162,8 @@ class DeviceMonitor:
                     "index": index,
                     "held": bool(holders),
                     "processes": holders,
-                    # Current tt-smi/driver APIs expose health telemetry and open
-                    # handles, but not compute occupancy or allocated DRAM bytes.
+                    # Current driver APIs expose health telemetry and open handles,
+                    # but not compute occupancy or allocated DRAM bytes.
                     "usage_percent": None,
                     "memory_usage_bytes": memory_used,
                     "memory_total_bytes": memory_total,
@@ -197,7 +173,7 @@ class DeviceMonitor:
                         else None
                     ),
                     "metric_availability": {
-                        "usage_percent": "not exposed by tt-smi 6.3.0",
+                        "usage_percent": "not exposed by the Tenstorrent driver",
                         "memory_usage_bytes": (
                             "tt-metal shared-memory allocator v3"
                             if memory

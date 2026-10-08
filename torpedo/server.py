@@ -3,11 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from torpedo.monitor import DeviceMonitor, create_tt_smi_backend
+from torpedo.monitor import DeviceMonitor
 
 
 class StatusServer(ThreadingHTTPServer):
@@ -50,12 +49,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--interval", type=float, default=1.0)
-    parser.add_argument(
-        "--backend",
-        choices=("luwen", "umd"),
-        default="luwen",
-        help="hardware backend (UMD performs full topology discovery)",
-    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -66,10 +59,7 @@ def main() -> None:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    monitor = DeviceMonitor(
-        interval=args.interval,
-        backend_factory=partial(create_tt_smi_backend, args.backend),
-    )
+    monitor = DeviceMonitor(interval=args.interval)
     monitor.start()
     server = StatusServer((args.host, args.port), monitor)
     try:

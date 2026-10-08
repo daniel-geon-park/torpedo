@@ -1,6 +1,6 @@
 import struct
 
-from torpedo.memory import REGION_MIN_SIZE, read_memory_stats
+from torpedo.memory import REGION_MIN_SIZE, physical_dram_bytes, read_memory_stats
 
 
 def test_reads_versioned_allocator_region(tmp_path):
@@ -27,3 +27,8 @@ def test_rejects_unknown_layout(tmp_path):
     struct.pack_into("=I", region, 0, 99)
     path.write_bytes(region)
     assert read_memory_stats([str(path)]) == {}
+
+
+def test_p150_capacity_without_opening_a_device():
+    info = {"board_info": {"board_type": "p150a"}}
+    assert physical_dram_bytes(info) == 32 * 1024**3
