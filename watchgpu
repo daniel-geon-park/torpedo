@@ -60,18 +60,18 @@ done
 # GB10 has unified memory: nvidia-smi reports N/A for memory/power-limit,
 # so memory comes from `free` and we also list compute processes.
 REMOTE_CMD='
-nvidia-smi --query-gpu=index,name,utilization.gpu,temperature.gpu,power.draw,memory.used,memory.total \
+nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,temperature.gpu,power.draw,memory.used,memory.total \
   --format=csv,noheader,nounits
 echo "===MEM==="
 free -m | awk "/^Mem:/{print \$3, \$2}"
 echo "===PROC==="
-nvidia-smi --query-compute-apps=pid,used_gpu_memory,process_name \
+nvidia-smi --query-compute-apps=gpu_uuid,pid,used_gpu_memory,process_name \
   --format=csv,noheader,nounits 2>/dev/null \
-| while IFS=", " read -r pid pmem pname; do
+| while IFS=", " read -r gpu_uuid pid pmem pname; do
     set -- $(ps -o rss=,user:32=,etimes=,ppid= -p "$pid" 2>/dev/null)
     # GB10 unified memory reports [N/A] per process -> fall back to RSS
     case "$pmem" in ""|*[!0-9]*) pmem=$(( ${1:-0} / 1024 )) ;; esac
-    echo "$pid|$pmem|${2:-?}|${3:-?}|${4:-?}|${pname##*/}"
+    echo "$gpu_uuid|$pid|$pmem|${2:-?}|${3:-?}|${4:-?}|${pname##*/}"
   done
 '
 TT_REMOTE_CMD=$(cat <<'REMOTE'
@@ -286,6 +286,68 @@ clip_procs() {
   fi
 }
 
+# Format the CUDA process records for one GPU. Input records are
+# "pid|memMB|user|etimes|ppid|name", already separated by GPU UUID.
+format_cuda_procs() {
+  local budget=$1
+  sort -t'|' -k2,2nr \
+    | awk -F'|' -v sp="$SHOWPID" -v su="$SHOWUSER" -v st="$SHOWTIME" \
+          -v budget="$budget" -v use_color="${RST:+1}" '
+      function ago(e) {
+        if (e !~ /^[0-9]+$/) return "?"
+        if (e < 60)    return e "s ago"
+        if (e < 3600)  return int(e/60) "m ago"
+        if (e < 86400) return int(e/3600) "h ago"
+        return int(e/86400) "d ago"
+      }
+      { pid[NR]=$1; mem[NR]=$2; usr[NR]=$3; et[NR]=$4; pp[NR]=$5; nm[NR]=$6
+        idx[$1] = NR }
+      END {
+        if (!NR) exit
+        # family root: follow ppid links within the displayed set
+        for (i = 1; i <= NR; i++) {
+          r = i
+          for (s = 0; s < NR && (pp[r] in idx) && idx[pp[r]] != r; s++)
+            r = idx[pp[r]]
+          root[i] = r; members[r]++
+        }
+        # one palette color per multi-process family, in display order
+        nc = split("95 94 96 92 91 93", pal, " ")
+        for (i = 1; i <= NR; i++) {
+          r = root[i]
+          if (members[r] > 1 && !(r in fam)) fam[r] = pal[(nfam++ % nc) + 1]
+        }
+        out = ""; used = 0
+        for (i = 1; i <= NR; i++) {
+          child = (root[i] != i)
+          t = (mem[i] == "") ? "?" : mem[i] "M"
+          if (sp) t = t ", " pid[i]
+          # user and launch time are the parents anyway -> hide on children
+          if (su && !child) t = t ", " usr[i]
+          if (st && !child) t = t ", " ago(et[i])
+          tok = nm[i] "(" t ")"
+          c = (root[i] in fam) ? fam[root[i]] : 2
+          need = length(tok) + (out == "" ? 0 : 1)
+          rem = budget - used
+          # keep one column spare for the ellipsis unless this token is last
+          if ((i < NR && need > rem - 1) || need > rem) {
+            # char-cut a stub of this token into whatever space remains
+            stub_w = rem - 1 - (out == "" ? 0 : 1)
+            if (stub_w > 3) {
+              stub = substr(tok, 1, stub_w)
+              if (use_color) stub = "\033[" c "m" stub "\033[0m"
+              out = out (out == "" ? "" : " ") stub
+            }
+            out = out "…"; break
+          }
+          if (use_color) tok = "\033[" c "m" tok "\033[0m"
+          out = out (out == "" ? "" : " ") tok
+          used += need
+        }
+        print out
+      }'
+}
+
 # split [user@]host[:port] into ssh target + optional -p flag
 ssh_target() {
   TARGET=$1 PORT= KIND=cuda
@@ -451,71 +513,20 @@ render() {
     fi
     gpu=$(sed -n '1,/^===MEM===$/p' "$tmpdir/$h.ok" | sed '$d')
     mem=$(sed -n '/^===MEM===$/,/^===PROC===$/p' "$tmpdir/$h.ok" | sed '1d;$d')
-    # procs carry their own per-family colors, so the width budget is
-    # enforced here (on visible chars, at token boundaries), not by fit_cols
-    # remote sends "pid|memMB|user|etimes|ppid|name" per process
-    procs=$(sed -n '/^===PROC===$/,$p' "$tmpdir/$h.ok" | sed '1d' \
-            | sort -t'|' -k2,2nr \
-            | awk -F'|' -v sp="$SHOWPID" -v su="$SHOWUSER" -v st="$SHOWTIME" \
-                  -v budget="$pbudget" -v use_color="${RST:+1}" '
-        function ago(e) {
-          if (e !~ /^[0-9]+$/) return "?"
-          if (e < 60)    return e "s ago"
-          if (e < 3600)  return int(e/60) "m ago"
-          if (e < 86400) return int(e/3600) "h ago"
-          return int(e/86400) "d ago"
-        }
-        { pid[NR]=$1; mem[NR]=$2; usr[NR]=$3; et[NR]=$4; pp[NR]=$5; nm[NR]=$6
-          idx[$1] = NR }
-        END {
-          if (!NR) exit
-          # family root: follow ppid links within the displayed set
-          for (i = 1; i <= NR; i++) {
-            r = i
-            for (s = 0; s < NR && (pp[r] in idx) && idx[pp[r]] != r; s++)
-              r = idx[pp[r]]
-            root[i] = r; members[r]++
-          }
-          # one palette color per multi-process family, in display order
-          nc = split("95 94 96 92 91 93", pal, " ")
-          for (i = 1; i <= NR; i++) {
-            r = root[i]
-            if (members[r] > 1 && !(r in fam)) fam[r] = pal[(nfam++ % nc) + 1]
-          }
-          out = ""; used = 0
-          for (i = 1; i <= NR; i++) {
-            child = (root[i] != i)
-            t = (mem[i] == "") ? "?" : mem[i] "M"
-            if (sp) t = t ", " pid[i]
-            # user and launch time are the parents anyway -> hide on children
-            if (su && !child) t = t ", " usr[i]
-            if (st && !child) t = t ", " ago(et[i])
-            tok = nm[i] "(" t ")"
-            c = (root[i] in fam) ? fam[root[i]] : 2
-            need = length(tok) + (out == "" ? 0 : 1)
-            rem = budget - used
-            # keep one column spare for the ellipsis unless this token is last
-            if ((i < NR && need > rem - 1) || need > rem) {
-              # char-cut a stub of this token into whatever space remains
-              stub_w = rem - 1 - (out == "" ? 0 : 1)
-              if (stub_w > 3) {
-                stub = substr(tok, 1, stub_w)
-                if (use_color) stub = "\033[" c "m" stub "\033[0m"
-                out = out (out == "" ? "" : " ") stub
-              }
-              out = out "…"; break
-            }
-            if (use_color) tok = "\033[" c "m" tok "\033[0m"
-            out = out (out == "" ? "" : " ") tok
-            used += need
-          }
-          print out
-        }')
+    # Split process records once per host, then render only the records whose
+    # UUID matches the current GPU. The formatter retains memory sorting,
+    # family colors, and terminal-width clipping independently for each GPU.
+    unset cuda_proc_rows
+    declare -A cuda_proc_rows=()
+    while IFS='|' read -r proc_uuid proc_record; do
+      [ -z "$proc_uuid" ] && continue
+      cuda_proc_rows["$proc_uuid"]+="$proc_record"$'\n'
+    done < <(sed -n '/^===PROC===$/,$p' "$tmpdir/$h.ok" | sed '1d')
     read -r host_mused host_mtotal <<< "$mem"
     first_gpu=1
     gpu_row=0
     gpu_count=$(grep -cE '^[0-9]+,' <<< "$gpu")
-    while IFS=',' read -r idx name util temp pdraw gpu_mused gpu_mtotal; do
+    while IFS=',' read -r idx uuid name util temp pdraw gpu_mused gpu_mtotal; do
       # nvidia-smi can print a device error before otherwise valid CSV rows
       # (for example when one GPU has fallen off the bus). Do not render that
       # diagnostic as an empty GPU record.
@@ -530,7 +541,7 @@ render() {
       else
         row_label=' --'
       fi
-      name=${name# } util=${util# } temp=${temp# } pdraw=${pdraw# }
+      uuid=${uuid# } name=${name# } util=${util# } temp=${temp# } pdraw=${pdraw# }
       gpu_mused=${gpu_mused# } gpu_mtotal=${gpu_mtotal# }
       name=${name#NVIDIA }
       name=${name/#Quadro /Qdro }
@@ -549,6 +560,7 @@ render() {
       tint "$util" 30 70;   c_util=$TINT
       tint "$temp" 60 80;   c_temp=$TINT
       tint "$mempct" 60 85; c_mem=$TINT
+      procs=$(printf '%s' "${cuda_proc_rows[$uuid]-}" | format_cuda_procs "$pbudget")
       emit_device_row "$last_gpu" "${CYAN}%-${HOSTW}s${RST} %-14s ${c_util}%4s%%${RST} ${c_temp}%4sC${RST} %6sW ${c_mem}%6sM/%7sM${RST}  %s%s" \
         "$row_label" "${name:0:14}" "$util" "$temp" "$pdraw" "$mused" "$mtotal" \
         "$staletag" "${procs:-${DIM}-${RST}}"
